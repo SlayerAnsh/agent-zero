@@ -771,20 +771,522 @@ curl -X POST http://localhost:50001/api/api_terminate_chat \
 
 ## Agent-to-Agent (A2A) Protocol
 
-Agent Zero also exposes an A2A endpoint for inter-agent communication. This uses the same API key (token) embedded in the URL path.
+Agent Zero implements the [FastA2A](https://github.com/pydantic/fasta2a) protocol, allowing multiple Agent Zero instances (or any A2A-compatible agent) to communicate with each other. The A2A server must be enabled in Settings (`a2a_server_enabled: true`).
+
+### Prerequisites
+
+- The `fasta2a` Python package must be installed (the server returns 503 if unavailable).
+- A2A server must be enabled in Settings.
+- The API token (same `mcp_server_token` used for the HTTP API) is used for authentication.
+
+### A2A Endpoint URLs
+
+Authentication is done via the token embedded in the URL path:
 
 ```
 POST /a2a/t-<API_TOKEN>
 POST /a2a/t-<API_TOKEN>/p-<PROJECT_NAME>
 ```
 
-The A2A protocol follows the FastA2A message format with `role`, `parts` (text, file), `message_id`, and optional `context_id`. This is primarily used for connecting multiple Agent Zero instances together.
+Alternative authentication (when token is not in URL path):
+- Header: `Authorization: Bearer <API_TOKEN>`
+- Header: `X-API-KEY: <API_TOKEN>`
+- Query param: `?api_key=<API_TOKEN>`
 
-**Connection URL format:**
+### Agent Card Discovery
+
+Every A2A-compliant agent exposes a card at:
 
 ```
-http://<host>:<port>/a2a/t-<API_TOKEN>
-http://<host>:<port>/a2a/t-<API_TOKEN>/p-<PROJECT_NAME>
+GET /.well-known/agent.json
+```
+
+This returns the agent's capabilities, skills, and metadata:
+
+```json
+{
+  "name": "Agent Zero",
+  "description": "A general AI assistant that can execute code, manage files, browse the web, and solve complex problems in an isolated Linux environment.",
+  "version": "1.0.0",
+  "provider": {
+    "organization": "Agent Zero",
+    "url": "https://github.com/frdel/agent-zero"
+  },
+  "skills": [
+    {
+      "id": "general_assistance",
+      "name": "General AI Assistant",
+      "description": "Provides general AI assistance including code execution, file management, web browsing, and problem solving",
+      "tags": ["ai", "assistant", "code", "files", "web", "automation"],
+      "examples": [
+        "Write and execute Python code",
+        "Manage files and directories",
+        "Browse the web and extract information"
+      ],
+      "input_modes": ["text/plain", "application/octet-stream"],
+      "output_modes": ["text/plain", "application/json"]
+    }
+  ]
+}
+```
+
+### A2A Message Format
+
+Messages follow the A2A specification with `role`, `parts`, and optional `metadata`:
+
+**Sending a message (client → server):**
+
+```json
+{
+  "role": "user",
+  "parts": [
+    {"kind": "text", "text": "Analyze this data"},
+    {"kind": "file", "file": {"uri": "/path/to/file.csv"}}
+  ],
+  "kind": "message",
+  "message_id": "unique-uuid",
+  "context_id": "optional-existing-context"
+}
+```
+
+**Receiving a response (server → client):**
+
+```json
+{
+  "role": "agent",
+  "parts": [
+    {"kind": "text", "text": "Here is the analysis..."}
+  ],
+  "kind": "message",
+  "message_id": "response-uuid"
+}
+```
+
+### A2A Task Lifecycle
+
+Each message sent creates a **task** that goes through these states:
+
+| State | Description |
+|-------|-------------|
+| `submitted` | Task received and queued |
+| `working` | Agent is processing the message |
+| `completed` | Agent finished, response available |
+| `failed` | Processing error occurred |
+| `canceled` | Task was cancelled |
+
+### Project Injection via URL
+
+When you include `/p-<PROJECT_NAME>` in the URL path, the project name is automatically injected into the message's `metadata.project` field. The A2A worker then activates that project for the conversation context.
+
+### A2A Behavior Notes
+
+- Each A2A message creates a **temporary background context** (`AgentContextType.BACKGROUND`).
+- The context is automatically **cleaned up after completion** — no manual termination needed.
+- There is no persistent conversation across A2A calls (each call is stateless on the server side).
+- The A2A server uses in-memory storage and broker — task state is lost on restart.
+
+### Python A2A Client
+
+Agent Zero includes a built-in A2A client (`helpers/fasta2a_client.py`) for connecting to remote agents:
+
+```python
+from helpers.fasta2a_client import AgentConnection
+
+async with AgentConnection("http://remote-host:50001/a2a/t-THEIR_TOKEN") as conn:
+    # Send a message
+    response = await conn.send_message(
+        message="Summarize the project status",
+        attachments=["/path/to/report.pdf"],       # optional file URIs
+        metadata={"project": "target-project"}     # optional project
+    )
+
+    # Extract result
+    task = response["result"]
+    task_id = task["id"]
+
+    # If not immediately completed, poll for result
+    final = await conn.wait_for_completion(task_id, poll_interval=2, max_wait=300)
+
+    # Get the agent's response text
+    history = final["result"]["history"]
+    reply = history[-1]["parts"][0]["text"]
+    print(reply)
+```
+
+**`AgentConnection` methods:**
+
+| Method | Description |
+|--------|-------------|
+| `get_agent_card()` | Fetch the remote agent's capabilities card |
+| `send_message(message, attachments?, context_id?, metadata?)` | Send a message, returns task info |
+| `get_task(task_id)` | Check task status |
+| `wait_for_completion(task_id, poll_interval=2, max_wait=300)` | Poll until task finishes |
+| `close()` | Close the HTTP connection |
+
+**Authentication options for the client:**
+
+```python
+# Token in URL path (recommended)
+conn = AgentConnection("http://host:50001/a2a/t-TOKEN_HERE")
+
+# Token as constructor argument (sent via Authorization + X-API-KEY headers)
+conn = AgentConnection("http://host:50001/a2a", token="TOKEN_HERE")
+
+# Token from environment variable A2A_TOKEN (fallback)
+conn = AgentConnection("http://host:50001/a2a")
+```
+
+---
+
+## End-to-End Examples
+
+### Example 1: Single Project Workflow
+
+Create a project, chat with the agent in that project's context, get the response, then deactivate and clean up.
+
+> **Note:** Project creation requires session auth (web UI). The example below uses the API key endpoints for chat and the session endpoints for project management. In practice, you would create projects via the web UI and then use the API key for chat.
+
+```python
+import requests
+
+BASE_URL = "http://localhost:50001"
+API_KEY = "your-api-key"
+
+HEADERS = {
+    "Content-Type": "application/json",
+    "X-API-KEY": API_KEY,
+}
+
+# For session-authenticated endpoints (projects), you need a session.
+# This helper logs in and maintains cookies + CSRF token.
+session = requests.Session()
+
+def login_and_get_csrf():
+    """Authenticate and retrieve a CSRF token for session-based endpoints."""
+    # Log in
+    session.post(f"{BASE_URL}/login", data={
+        "username": "your-username",
+        "password": "your-password",
+    })
+    # Get CSRF token
+    resp = session.get(f"{BASE_URL}/api/csrf_token")
+    csrf_data = resp.json()
+    return csrf_data["token"]
+
+csrf_token = login_and_get_csrf()
+session_headers = {
+    "Content-Type": "application/json",
+    "X-CSRF-Token": csrf_token,
+}
+
+
+# ─── Step 1: Create a project ────────────────────────────────────────
+resp = session.post(f"{BASE_URL}/api/projects", headers=session_headers, json={
+    "action": "create",
+    "project": {
+        "name": "data-analysis",
+        "title": "Data Analysis Project",
+        "description": "Automated data analysis pipeline",
+        "instructions": "You are a data analyst. Analyze CSV files and produce summary statistics.",
+        "color": "blue",
+        "git_url": "",
+        "file_structure": {
+            "enabled": True,
+            "max_depth": 5,
+            "max_files": 20,
+            "max_folders": 20,
+            "max_lines": 250,
+            "gitignore": "",
+        },
+    },
+})
+project = resp.json()
+print(f"Created project: {project['data']['name']}")
+
+
+# ─── Step 2: Start a chat with the project ───────────────────────────
+resp = requests.post(f"{BASE_URL}/api/api_message", headers=HEADERS, json={
+    "message": "Load the sales data from /a0/usr/projects/data-analysis/sales.csv and show top 5 products by revenue.",
+    "project_name": "data-analysis",
+})
+data = resp.json()
+context_id = data["context_id"]
+print(f"Context: {context_id}")
+print(f"Agent: {data['response']}")
+
+
+# ─── Step 3: Follow-up message in the same chat ──────────────────────
+resp = requests.post(f"{BASE_URL}/api/api_message", headers=HEADERS, json={
+    "context_id": context_id,
+    "message": "Now create a bar chart of those results and save it as chart.png",
+})
+data = resp.json()
+print(f"Agent: {data['response']}")
+
+
+# ─── Step 4: Retrieve the generated file ─────────────────────────────
+import base64
+
+resp = requests.post(f"{BASE_URL}/api/api_files_get", headers=HEADERS, json={
+    "paths": ["/a0/usr/projects/data-analysis/chart.png"],
+})
+for filename, b64content in resp.json().items():
+    with open(filename, "wb") as f:
+        f.write(base64.b64decode(b64content))
+    print(f"Downloaded: {filename}")
+
+
+# ─── Step 5: Review the full activity log ─────────────────────────────
+resp = requests.post(f"{BASE_URL}/api/api_log_get", headers=HEADERS, json={
+    "context_id": context_id,
+    "length": 50,
+})
+logs = resp.json()
+print(f"\n--- Activity Log ({logs['log']['total_items']} items) ---")
+for item in logs["log"]["items"]:
+    print(f"  [{item['type']:10s}] {item.get('content', '')[:80]}")
+
+
+# ─── Step 6: Deactivate the project from the chat ────────────────────
+resp = session.post(f"{BASE_URL}/api/projects", headers=session_headers, json={
+    "action": "deactivate",
+    "context_id": context_id,
+})
+print(f"\nProject deactivated: {resp.json()['ok']}")
+
+
+# ─── Step 7: Clean up the chat ───────────────────────────────────────
+resp = requests.post(f"{BASE_URL}/api/api_terminate_chat", headers=HEADERS, json={
+    "context_id": context_id,
+})
+print(f"Chat terminated: {resp.json()['success']}")
+
+
+# ─── Optional: Delete the project entirely ────────────────────────────
+resp = session.post(f"{BASE_URL}/api/projects", headers=session_headers, json={
+    "action": "delete",
+    "name": "data-analysis",
+})
+print(f"Project deleted: {resp.json()['ok']}")
+```
+
+### Example 2: Two Projects with Agent-to-Agent Communication
+
+This example shows two Agent Zero instances (or one instance with two projects) where:
+- **Project A** ("frontend-app") handles frontend questions
+- **Project B** ("backend-api") handles backend questions
+- An external orchestrator sends a task to Project A, which then delegates a subtask to Project B via the A2A protocol
+
+**Architecture:**
+
+```
+                          ┌──────────────────────┐
+                          │   Your Application   │
+                          │   (orchestrator)      │
+                          └──────┬───────────────┘
+                                 │  HTTP API
+                    ┌────────────┴────────────┐
+                    ▼                          ▼
+          ┌─────────────────┐       ┌─────────────────┐
+          │  Instance A      │       │  Instance B      │
+          │  :50001          │◄─────►│  :50002          │
+          │  frontend-app    │  A2A  │  backend-api     │
+          └─────────────────┘       └─────────────────┘
+```
+
+**Step 1: Set up both instances**
+
+Instance A runs on port 50001, Instance B on port 50002. Both have A2A enabled in Settings (`a2a_server_enabled: true`).
+
+**Step 2: Orchestrator script**
+
+```python
+import requests
+import asyncio
+from helpers.fasta2a_client import AgentConnection
+
+# ─── Configuration ────────────────────────────────────────────────────
+INSTANCE_A_URL = "http://localhost:50001"
+INSTANCE_B_URL = "http://localhost:50002"
+TOKEN_A = "instance-a-api-key"
+TOKEN_B = "instance-b-api-key"
+
+HEADERS_A = {"Content-Type": "application/json", "X-API-KEY": TOKEN_A}
+HEADERS_B = {"Content-Type": "application/json", "X-API-KEY": TOKEN_B}
+
+
+# ─── Step 1: Send task to Frontend Agent (Instance A) ────────────────
+print("=== Talking to Frontend Agent ===")
+resp = requests.post(f"{INSTANCE_A_URL}/api/api_message", headers=HEADERS_A, json={
+    "message": "Review the login page component and list all API endpoints it calls.",
+    "project_name": "frontend-app",
+})
+frontend_data = resp.json()
+context_a = frontend_data["context_id"]
+print(f"Frontend Agent: {frontend_data['response']}")
+
+
+# ─── Step 2: Send task to Backend Agent (Instance B) ─────────────────
+# Use the frontend agent's findings to ask the backend agent about those endpoints
+print("\n=== Talking to Backend Agent ===")
+resp = requests.post(f"{INSTANCE_B_URL}/api/api_message", headers=HEADERS_B, json={
+    "message": f"The frontend login page calls these endpoints. Check if they are all implemented and document any missing ones:\n\n{frontend_data['response']}",
+    "project_name": "backend-api",
+})
+backend_data = resp.json()
+context_b = backend_data["context_id"]
+print(f"Backend Agent: {backend_data['response']}")
+
+
+# ─── Step 3: Feed backend results back to frontend agent ─────────────
+print("\n=== Sending backend findings back to Frontend Agent ===")
+resp = requests.post(f"{INSTANCE_A_URL}/api/api_message", headers=HEADERS_A, json={
+    "context_id": context_a,
+    "message": f"The backend team reviewed your endpoint list. Here is their report. Update the login component to handle any missing endpoints gracefully:\n\n{backend_data['response']}",
+})
+final_data = resp.json()
+print(f"Frontend Agent: {final_data['response']}")
+
+
+# ─── Step 4: Clean up both chats ─────────────────────────────────────
+requests.post(f"{INSTANCE_A_URL}/api/api_terminate_chat", headers=HEADERS_A, json={"context_id": context_a})
+requests.post(f"{INSTANCE_B_URL}/api/api_terminate_chat", headers=HEADERS_B, json={"context_id": context_b})
+print("\nBoth chats cleaned up.")
+```
+
+**Step 3: Direct A2A communication (agent-to-agent without orchestrator)**
+
+If you want Instance A's agent to directly talk to Instance B during its own processing (without an external orchestrator), you can use the built-in `a2a_chat` tool. Configure Instance A's project instructions to include the connection info:
+
+```
+When you need backend API information, use the a2a_chat tool to ask the backend agent:
+- Connection URL: http://localhost:50002/a2a/t-INSTANCE_B_TOKEN/p-backend-api
+```
+
+Or use the A2A client directly in a Python script:
+
+```python
+import asyncio
+from helpers.fasta2a_client import AgentConnection
+
+
+async def a2a_cross_project_chat():
+    """
+    Direct agent-to-agent communication between two Agent Zero instances.
+    Instance A asks Instance B a question via the A2A protocol.
+    """
+
+    # ─── Connect to Instance B's A2A endpoint ─────────────────────────
+    # Token is embedded in the URL; /p-backend-api activates the project
+    a2a_url = "http://localhost:50002/a2a/t-INSTANCE_B_TOKEN/p-backend-api"
+
+    async with AgentConnection(a2a_url) as remote_agent:
+        # Check what the remote agent can do
+        card = await remote_agent.get_agent_card()
+        print(f"Connected to: {card['name']}")
+        print(f"Skills: {[s['name'] for s in card.get('skills', [])]}")
+
+        # ─── Send first message ───────────────────────────────────────
+        print("\n--- Message 1 ---")
+        response = await remote_agent.send_message(
+            message="List all REST API endpoints in the authentication module"
+        )
+        task = response["result"]
+        print(f"Task ID: {task['id']}")
+        print(f"State: {task['status']['state']}")
+
+        # If the response is already completed (blocking mode)
+        if task["status"]["state"] == "completed":
+            reply = task["history"][-1]["parts"][0]["text"]
+            print(f"Agent reply: {reply[:200]}...")
+        else:
+            # Poll until done
+            final = await remote_agent.wait_for_completion(
+                task["id"], poll_interval=2, max_wait=120
+            )
+            reply = final["result"]["history"][-1]["parts"][0]["text"]
+            print(f"Agent reply: {reply[:200]}...")
+
+        # ─── Send follow-up (note: A2A is stateless per-call on server) ─
+        # Each A2A call creates a fresh context, so include full context
+        print("\n--- Message 2 ---")
+        response2 = await remote_agent.send_message(
+            message=f"Given these endpoints:\n{reply}\n\nWhich ones require JWT tokens and which use API keys?"
+        )
+        task2 = response2["result"]
+
+        if task2["status"]["state"] == "completed":
+            reply2 = task2["history"][-1]["parts"][0]["text"]
+            print(f"Agent reply: {reply2[:200]}...")
+
+
+# Run it
+asyncio.run(a2a_cross_project_chat())
+```
+
+### Example 3: Full Async Two-Project Pipeline via HTTP API Only
+
+No A2A setup required — uses only the HTTP API endpoints with API keys. Good for when both projects run on the same instance.
+
+```python
+import requests
+
+BASE_URL = "http://localhost:50001"
+API_KEY = "your-api-key"
+HEADERS = {"Content-Type": "application/json", "X-API-KEY": API_KEY}
+
+
+def chat(message, project_name=None, context_id=None):
+    """Send a message and return (context_id, response)."""
+    payload = {"message": message}
+    if project_name:
+        payload["project_name"] = project_name
+    if context_id:
+        payload["context_id"] = context_id
+    resp = requests.post(f"{BASE_URL}/api/api_message", headers=HEADERS, json=payload)
+    data = resp.json()
+    return data["context_id"], data["response"]
+
+
+def terminate(context_id):
+    """Delete a chat context."""
+    requests.post(f"{BASE_URL}/api/api_terminate_chat", headers=HEADERS, json={
+        "context_id": context_id,
+    })
+
+
+# ─── Phase 1: Ask the "researcher" project to gather information ──────
+ctx_research, research_output = chat(
+    message="Search the codebase for all database migration files and summarize the schema changes in the last 5 migrations.",
+    project_name="researcher",
+)
+print(f"[Researcher] {research_output[:200]}...")
+
+# ─── Phase 2: Feed research into the "writer" project ─────────────────
+ctx_writer, writer_output = chat(
+    message=f"Based on the following schema change summary, write a changelog entry for the next release:\n\n{research_output}",
+    project_name="writer",
+)
+print(f"[Writer] {writer_output[:200]}...")
+
+# ─── Phase 3: Send the draft back to researcher for fact-checking ─────
+_, review_output = chat(
+    message=f"Fact-check this changelog draft against the actual migration files. Flag any inaccuracies:\n\n{writer_output}",
+    context_id=ctx_research,  # reuse the researcher's context (it has the files loaded)
+)
+print(f"[Researcher Review] {review_output[:200]}...")
+
+# ─── Phase 4: Final edit by writer ────────────────────────────────────
+_, final_output = chat(
+    message=f"Apply these corrections to your draft and produce the final changelog:\n\n{review_output}",
+    context_id=ctx_writer,  # reuse the writer's context
+)
+print(f"[Final Changelog]\n{final_output}")
+
+# ─── Clean up ─────────────────────────────────────────────────────────
+terminate(ctx_research)
+terminate(ctx_writer)
+print("\nDone. Both contexts cleaned up.")
 ```
 
 ---
@@ -796,3 +1298,5 @@ http://<host>:<port>/a2a/t-<API_TOKEN>/p-<PROJECT_NAME>
 - **Chat expiry:** Chats created via the external API have a configurable lifetime (`lifetime_hours`, default 24). Expired chats are cleaned up automatically.
 - **File paths:** Files generated by the agent are stored under `/a0/usr/` internally. Use the `/api/api_files_get` endpoint to retrieve them.
 - **Project storage:** Projects are stored on disk at `usr/projects/{project_name}/` with metadata in `.a0proj/`.
+- **A2A is stateless:** Each A2A call creates a temporary background context that is destroyed after the response. There is no persistent conversation across A2A calls.
+- **A2A requires `fasta2a` package:** The A2A server returns 503 if the package is not installed. The client (`AgentConnection`) raises `RuntimeError` if unavailable.
