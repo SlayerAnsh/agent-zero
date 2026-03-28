@@ -727,6 +727,344 @@ requests.post(f"{BASE_URL}/api/api_terminate_chat", headers=HEADERS, json={
 })
 ```
 
+### TypeScript Example
+
+```typescript
+const BASE_URL = "http://localhost:50001";
+const API_KEY = "your-api-key";
+
+const headers = {
+  "Content-Type": "application/json",
+  "X-API-KEY": API_KEY,
+};
+
+interface MessageResponse {
+  context_id: string;
+  response: string;
+}
+
+interface LogResponse {
+  context_id: string;
+  log: {
+    guid: string;
+    total_items: number;
+    returned_items: number;
+    start_position: number;
+    progress: string;
+    progress_active: boolean;
+    items: Array<{
+      no: number;
+      type: string;
+      heading: string;
+      content: string;
+      kvps: Record<string, unknown>;
+      id: string | null;
+    }>;
+  };
+}
+
+interface TerminateResponse {
+  success: boolean;
+  message: string;
+  context_id: string;
+}
+
+async function sendMessage(
+  message: string,
+  contextId?: string,
+  projectName?: string
+): Promise<MessageResponse> {
+  const body: Record<string, unknown> = { message };
+  if (contextId) body.context_id = contextId;
+  if (projectName) body.project_name = projectName;
+
+  const resp = await fetch(`${BASE_URL}/api/api_message`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    const err = await resp.json();
+    throw new Error(err.error ?? `HTTP ${resp.status}`);
+  }
+  return resp.json();
+}
+
+async function getLogs(
+  contextId: string,
+  length = 50
+): Promise<LogResponse> {
+  const resp = await fetch(`${BASE_URL}/api/api_log_get`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ context_id: contextId, length }),
+  });
+  return resp.json();
+}
+
+async function getFiles(
+  paths: string[]
+): Promise<Record<string, string>> {
+  const resp = await fetch(`${BASE_URL}/api/api_files_get`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ paths }),
+  });
+  return resp.json();
+}
+
+async function terminateChat(
+  contextId: string
+): Promise<TerminateResponse> {
+  const resp = await fetch(`${BASE_URL}/api/api_terminate_chat`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ context_id: contextId }),
+  });
+  return resp.json();
+}
+
+// ─── Usage ───────────────────────────────────────────────────────────
+async function main() {
+  // Start a conversation with a project
+  const first = await sendMessage(
+    "Analyze the codebase and list the main modules",
+    undefined,
+    "my-project"
+  );
+  const contextId = first.context_id;
+  console.log("Agent:", first.response);
+
+  // Continue the conversation
+  const second = await sendMessage(
+    "Now create a summary document",
+    contextId
+  );
+  console.log("Agent:", second.response);
+
+  // Get conversation logs
+  const logs = await getLogs(contextId);
+  for (const item of logs.log.items) {
+    console.log(`[${item.type}] ${item.content.slice(0, 100)}`);
+  }
+
+  // Download generated files
+  const files = await getFiles([
+    "/a0/usr/projects/my-project/summary.md",
+  ]);
+  for (const [filename, b64] of Object.entries(files)) {
+    const buf = Buffer.from(b64, "base64");
+    const fs = await import("fs/promises");
+    await fs.writeFile(filename, buf);
+    console.log(`Downloaded: ${filename}`);
+  }
+
+  // Clean up
+  await terminateChat(contextId);
+}
+
+main().catch(console.error);
+```
+
+### Go Example
+
+```go
+package main
+
+import (
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+)
+
+const (
+	baseURL = "http://localhost:50001"
+	apiKey  = "your-api-key"
+)
+
+// ─── Types ───────────────────────────────────────────────────────────
+
+type MessageRequest struct {
+	Message     string       `json:"message"`
+	ContextID   string       `json:"context_id,omitempty"`
+	ProjectName string       `json:"project_name,omitempty"`
+	Attachments []Attachment `json:"attachments,omitempty"`
+}
+
+type Attachment struct {
+	Filename string `json:"filename"`
+	Base64   string `json:"base64"`
+}
+
+type MessageResponse struct {
+	ContextID string `json:"context_id"`
+	Response  string `json:"response"`
+}
+
+type LogResponse struct {
+	ContextID string `json:"context_id"`
+	Log       struct {
+		GUID           string    `json:"guid"`
+		TotalItems     int       `json:"total_items"`
+		ReturnedItems  int       `json:"returned_items"`
+		StartPosition  int       `json:"start_position"`
+		Progress       string    `json:"progress"`
+		ProgressActive bool      `json:"progress_active"`
+		Items          []LogItem `json:"items"`
+	} `json:"log"`
+}
+
+type LogItem struct {
+	No      int                    `json:"no"`
+	Type    string                 `json:"type"`
+	Heading string                 `json:"heading"`
+	Content string                 `json:"content"`
+	KVPs    map[string]interface{} `json:"kvps"`
+	ID      *string                `json:"id"`
+}
+
+type TerminateResponse struct {
+	Success   bool   `json:"success"`
+	Message   string `json:"message"`
+	ContextID string `json:"context_id"`
+}
+
+// ─── HTTP helper ─────────────────────────────────────────────────────
+
+func apiPost(path string, payload interface{}, result interface{}) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("new request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-KEY", apiKey)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read body: %w", err)
+	}
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	return json.Unmarshal(respBody, result)
+}
+
+// ─── API functions ───────────────────────────────────────────────────
+
+func sendMessage(message, contextID, projectName string) (*MessageResponse, error) {
+	req := MessageRequest{
+		Message:     message,
+		ContextID:   contextID,
+		ProjectName: projectName,
+	}
+	var res MessageResponse
+	err := apiPost("/api/api_message", req, &res)
+	return &res, err
+}
+
+func getLogs(contextID string, length int) (*LogResponse, error) {
+	req := map[string]interface{}{
+		"context_id": contextID,
+		"length":     length,
+	}
+	var res LogResponse
+	err := apiPost("/api/api_log_get", req, &res)
+	return &res, err
+}
+
+func getFiles(paths []string) (map[string]string, error) {
+	req := map[string]interface{}{"paths": paths}
+	var res map[string]string
+	err := apiPost("/api/api_files_get", req, &res)
+	return res, err
+}
+
+func terminateChat(contextID string) (*TerminateResponse, error) {
+	req := map[string]string{"context_id": contextID}
+	var res TerminateResponse
+	err := apiPost("/api/api_terminate_chat", req, &res)
+	return &res, err
+}
+
+func resetChat(contextID string) error {
+	req := map[string]string{"context_id": contextID}
+	var res map[string]interface{}
+	return apiPost("/api/api_reset_chat", req, &res)
+}
+
+// ─── Main ────────────────────────────────────────────────────────────
+
+func main() {
+	// Start a conversation with a project
+	first, err := sendMessage(
+		"Analyze the codebase and list the main modules",
+		"",          // no context_id — creates new chat
+		"my-project", // activate this project
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	contextID := first.ContextID
+	fmt.Println("Agent:", first.Response)
+
+	// Continue the conversation
+	second, err := sendMessage("Now create a summary document", contextID, "")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("Agent:", second.Response)
+
+	// Get conversation logs
+	logs, err := getLogs(contextID, 50)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	for _, item := range logs.Log.Items {
+		content := item.Content
+		if len(content) > 100 {
+			content = content[:100]
+		}
+		fmt.Printf("[%s] %s\n", item.Type, content)
+	}
+
+	// Download generated files
+	files, err := getFiles([]string{"/a0/usr/projects/my-project/summary.md"})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	for filename, b64Content := range files {
+		data, _ := base64.StdEncoding.DecodeString(b64Content)
+		os.WriteFile(filename, data, 0644)
+		fmt.Printf("Downloaded: %s\n", filename)
+	}
+
+	// Clean up
+	terminateChat(contextID)
+}
+```
+
 ### cURL Quick Reference
 
 ```bash
@@ -1224,9 +1562,11 @@ async def a2a_cross_project_chat():
 asyncio.run(a2a_cross_project_chat())
 ```
 
-### Example 3: Full Async Two-Project Pipeline via HTTP API Only
+### Example 3: Two-Project Pipeline via HTTP API Only
 
-No A2A setup required — uses only the HTTP API endpoints with API keys. Good for when both projects run on the same instance.
+No A2A setup required — uses only the HTTP API endpoints with API keys. Good for when both projects run on the same instance. Examples in Python, TypeScript, and Go.
+
+#### Python
 
 ```python
 import requests
@@ -1287,6 +1627,213 @@ print(f"[Final Changelog]\n{final_output}")
 terminate(ctx_research)
 terminate(ctx_writer)
 print("\nDone. Both contexts cleaned up.")
+```
+
+#### TypeScript
+
+```typescript
+const BASE_URL = "http://localhost:50001";
+const API_KEY = "your-api-key";
+
+const headers = {
+  "Content-Type": "application/json",
+  "X-API-KEY": API_KEY,
+};
+
+interface ChatResult {
+  context_id: string;
+  response: string;
+}
+
+async function chat(
+  message: string,
+  projectName?: string,
+  contextId?: string
+): Promise<ChatResult> {
+  const body: Record<string, string> = { message };
+  if (projectName) body.project_name = projectName;
+  if (contextId) body.context_id = contextId;
+
+  const resp = await fetch(`${BASE_URL}/api/api_message`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
+  return resp.json();
+}
+
+async function terminate(contextId: string): Promise<void> {
+  await fetch(`${BASE_URL}/api/api_terminate_chat`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ context_id: contextId }),
+  });
+}
+
+async function main() {
+  // Phase 1: Ask the "researcher" project to gather information
+  const research = await chat(
+    "Search the codebase for all database migration files and summarize the schema changes in the last 5 migrations.",
+    "researcher"
+  );
+  const ctxResearch = research.context_id;
+  console.log("[Researcher]", research.response.slice(0, 200), "...");
+
+  // Phase 2: Feed research into the "writer" project
+  const writer = await chat(
+    `Based on the following schema change summary, write a changelog entry for the next release:\n\n${research.response}`,
+    "writer"
+  );
+  const ctxWriter = writer.context_id;
+  console.log("[Writer]", writer.response.slice(0, 200), "...");
+
+  // Phase 3: Send the draft back to researcher for fact-checking
+  const review = await chat(
+    `Fact-check this changelog draft against the actual migration files. Flag any inaccuracies:\n\n${writer.response}`,
+    undefined,
+    ctxResearch // reuse the researcher's context
+  );
+  console.log("[Researcher Review]", review.response.slice(0, 200), "...");
+
+  // Phase 4: Final edit by writer
+  const final_ = await chat(
+    `Apply these corrections to your draft and produce the final changelog:\n\n${review.response}`,
+    undefined,
+    ctxWriter // reuse the writer's context
+  );
+  console.log("[Final Changelog]");
+  console.log(final_.response);
+
+  // Clean up
+  await terminate(ctxResearch);
+  await terminate(ctxWriter);
+  console.log("\nDone. Both contexts cleaned up.");
+}
+
+main().catch(console.error);
+```
+
+#### Go
+
+```go
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+)
+
+const (
+	baseURL = "http://localhost:50001"
+	apiKey  = "your-api-key"
+)
+
+type chatResult struct {
+	ContextID string `json:"context_id"`
+	Response  string `json:"response"`
+}
+
+func apiPost(path string, payload interface{}, result interface{}) error {
+	body, _ := json.Marshal(payload)
+	req, _ := http.NewRequest("POST", baseURL+path, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-KEY", apiKey)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, respBody)
+	}
+	return json.Unmarshal(respBody, result)
+}
+
+func chat(message, projectName, contextID string) (*chatResult, error) {
+	payload := map[string]string{"message": message}
+	if projectName != "" {
+		payload["project_name"] = projectName
+	}
+	if contextID != "" {
+		payload["context_id"] = contextID
+	}
+	var res chatResult
+	err := apiPost("/api/api_message", payload, &res)
+	return &res, err
+}
+
+func terminate(contextID string) {
+	var res map[string]interface{}
+	apiPost("/api/api_terminate_chat", map[string]string{"context_id": contextID}, &res)
+}
+
+func truncate(s string, n int) string {
+	if len(s) > n {
+		return s[:n] + "..."
+	}
+	return s
+}
+
+func main() {
+	// Phase 1: Ask the "researcher" project to gather information
+	research, err := chat(
+		"Search the codebase for all database migration files and summarize the schema changes in the last 5 migrations.",
+		"researcher", "",
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	ctxResearch := research.ContextID
+	fmt.Printf("[Researcher] %s\n", truncate(research.Response, 200))
+
+	// Phase 2: Feed research into the "writer" project
+	writer, err := chat(
+		fmt.Sprintf("Based on the following schema change summary, write a changelog entry for the next release:\n\n%s", research.Response),
+		"writer", "",
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	ctxWriter := writer.ContextID
+	fmt.Printf("[Writer] %s\n", truncate(writer.Response, 200))
+
+	// Phase 3: Send the draft back to researcher for fact-checking
+	review, err := chat(
+		fmt.Sprintf("Fact-check this changelog draft against the actual migration files. Flag any inaccuracies:\n\n%s", writer.Response),
+		"", ctxResearch, // reuse the researcher's context
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("[Researcher Review] %s\n", truncate(review.Response, 200))
+
+	// Phase 4: Final edit by writer
+	final, err := chat(
+		fmt.Sprintf("Apply these corrections to your draft and produce the final changelog:\n\n%s", review.Response),
+		"", ctxWriter, // reuse the writer's context
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("[Final Changelog]\n%s\n", final.Response)
+
+	// Clean up
+	terminate(ctxResearch)
+	terminate(ctxWriter)
+	fmt.Println("\nDone. Both contexts cleaned up.")
+}
 ```
 
 ---
